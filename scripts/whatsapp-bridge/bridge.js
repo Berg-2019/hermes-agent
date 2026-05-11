@@ -383,6 +383,7 @@ const _ACCEPTED_HOST_VALUES = new Set([
   '127.0.0.1',
   '[::1]',
   '::1',
+  'hermes',
 ]);
 
 app.use((req, res, next) => {
@@ -476,7 +477,7 @@ function inferMediaType(ext) {
   return 'document';
 }
 
-// Send media (image, video, document) natively
+// Send media (image, video, document) natively — via filePath (local filesystem)
 app.post('/send-media', async (req, res) => {
   if (!sock || connectionState !== 'connected') {
     return res.status(503).json({ error: 'Not connected to WhatsApp' });
@@ -522,7 +523,62 @@ app.post('/send-media', async (req, res) => {
 
     const sent = await sock.sendMessage(chatId, msgPayload);
 
-    // Track sent message ID to prevent echo-back loops
+    if (sent?.key?.id) {
+      recentlySentIds.add(sent.key.id);
+      if (recentlySentIds.size > MAX_RECENT_IDS) {
+        recentlySentIds.delete(recentlySentIds.values().next().value);
+      }
+    }
+
+    res.json({ success: true, messageId: sent?.key?.id });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Send media via base64 buffer (avoids filesystem dependency — consumer downloads HTTP)
+app.post('/send-media-buffer', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, base64, mediaType, caption, fileName, mimeType: reqMimeType } = req.body;
+  if (!chatId || !base64) {
+    return res.status(400).json({ error: 'chatId and base64 are required' });
+  }
+
+  try {
+    const buffer = Buffer.from(base64, 'base64');
+    const ext = fileName ? fileName.toLowerCase().split('.').pop() : '';
+    const type = mediaType || (ext ? inferMediaType(ext) : 'document');
+    const mimeType = reqMimeType || MIME_MAP[ext] || 'application/octet-stream';
+    let msgPayload;
+
+    switch (type) {
+      case 'image':
+        msgPayload = { image: buffer, caption: caption || undefined, mimetype: mimeType };
+        break;
+      case 'video':
+        msgPayload = { video: buffer, caption: caption || undefined, mimetype: mimeType };
+        break;
+      case 'audio': {
+        const audioMime = (ext === 'ogg' || ext === 'opus') ? 'audio/ogg; codecs=opus' : 'audio/mpeg';
+        msgPayload = { audio: buffer, mimetype: audioMime, ptt: ext === 'ogg' || ext === 'opus' };
+        break;
+      }
+      case 'document':
+      default:
+        msgPayload = {
+          document: buffer,
+          fileName: fileName || 'document',
+          caption: caption || undefined,
+          mimetype: mimeType,
+        };
+        break;
+    }
+
+    const sent = await sock.sendMessage(chatId, msgPayload);
+
     if (sent?.key?.id) {
       recentlySentIds.add(sent.key.id);
       if (recentlySentIds.size > MAX_RECENT_IDS) {
@@ -595,7 +651,7 @@ if (PAIR_ONLY) {
   console.log();
   startSocket();
 } else {
-  app.listen(PORT, '127.0.0.1', () => {
+  app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌉 WhatsApp bridge listening on port ${PORT} (mode: ${WHATSAPP_MODE})`);
     console.log(`📁 Session stored in: ${SESSION_DIR}`);
     if (ALLOWED_USERS.size > 0) {
