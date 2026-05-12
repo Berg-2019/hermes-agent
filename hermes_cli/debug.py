@@ -1,13 +1,19 @@
-"""``hermes debug`` — debug tools for Hermes Agent.
+"""``hermes debug`` debug tools for Hermes Agent.
 
 Currently supports:
     hermes debug share    Upload debug report (system info + logs) to a
                           paste service and print a shareable URL.
+                          By default, log content is run through
+                          ``agent.redact.redact_sensitive_text`` with
+                          ``force=True`` before upload so credentials in
+                          ``~/.hermes/logs/*.log`` are not leaked into
+                          the public paste service. Pass ``--no-redact``
+                          to disable.
 """
 
 import io
 import json
-import os
+import logging
 import sys
 import time
 import urllib.error
@@ -18,6 +24,17 @@ from pathlib import Path
 from typing import Optional
 
 from hermes_constants import get_hermes_home
+from utils import atomic_replace
+
+logger = logging.getLogger(__name__)
+
+# Banner prepended to upload-bound log content when redaction is enabled.
+# Visible in the public paste so reviewers know the content was sanitized.
+# Kept short; the trailing newline guarantees the banner sits on its own line.
+_REDACTION_BANNER = (
+    "[hermes debug share: log content redacted at upload time. "
+    "run with --no-redact to disable]\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +62,13 @@ def _pending_file() -> Path:
     Each entry: ``{"url": "...", "expire_at": <unix_ts>}``.  Scheduled
     DELETEs used to be handled by spawning a detached Python process per
     paste that slept for 6 hours; those accumulated forever if the user
-    ran ``hermes debug share`` repeatedly.  We now persist the schedule
-    to disk and sweep expired entries on the next debug invocation.
+    ran ``hermes debug share`` repeatedly.
+
+    Deletion is now driven by the gateway's cron ticker
+    (``gateway/run.py::_start_cron_ticker``) which calls
+    ``_sweep_expired_pastes`` once per hour.  ``hermes debug share`` also
+    runs an opportunistic sweep on entry as a fallback for CLI-only users
+    who never start the gateway.
     """
     return get_hermes_home() / "pastes" / "pending.json"
 
@@ -74,7 +96,7 @@ def _save_pending(entries: list[dict]) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp = path.with_suffix(".json.tmp")
         tmp.write_text(json.dumps(entries, indent=2), encoding="utf-8")
-        os.replace(tmp, path)
+        atomic_replace(tmp, path)
     except OSError:
         # Non-fatal — worst case the user has to run ``hermes debug delete``
         # manually.
@@ -223,9 +245,10 @@ def _schedule_auto_delete(urls: list[str], delay_seconds: int = _AUTO_DELETE_SEC
     interpreters that never exited until the sleep completed.
 
     The replacement is stateless: we append to ``~/.hermes/pastes/pending.json``
-    and rely on opportunistic sweeps (``_sweep_expired_pastes``) called from
-    every ``hermes debug`` invocation.  If the user never runs ``hermes debug``
-    again, paste.rs's own retention policy handles cleanup.
+    and the gateway's cron ticker sweeps expired entries once per hour.
+    ``hermes debug share`` also runs an opportunistic sweep as a fallback
+    for CLI-only users.  If neither runs again, paste.rs's own retention
+    policy handles cleanup.
     """
     _record_pending(urls, delay_seconds=delay_seconds)
 
@@ -332,28 +355,50 @@ class LogSnapshot:
     tail_text: str
     full_text: Optional[str]
 
-def _resolve_log_path(log_name: str) -> Optional[Path]:
-    """Find the log file for *log_name*, falling back to the .1 rotation.
 
-    Returns the path if found, or None.
-    """
+def _primary_log_path(log_name: str) -> Optional[Path]:
+    """Where *log_name* would live if present. Doesn't check existence."""
     from hermes_cli.logs import LOG_FILES
 
     filename = LOG_FILES.get(log_name)
-    if not filename:
+    return (get_hermes_home() / "logs" / filename) if filename else None
+
+
+def _resolve_log_path(log_name: str) -> Optional[Path]:
+    """Find the log file for *log_name*, falling back to the .1 rotation.
+
+    Returns the first non-empty candidate (primary, then .1), or None.
+    Callers distinguish 'empty primary' from 'truly missing' via
+    :func:`_primary_log_path`.
+    """
+    primary = _primary_log_path(log_name)
+    if primary is None:
         return None
 
-    log_dir = get_hermes_home() / "logs"
-    primary = log_dir / filename
     if primary.exists() and primary.stat().st_size > 0:
         return primary
 
-    # Fall back to the most recent rotated file (.1).
-    rotated = log_dir / f"{filename}.1"
+    rotated = primary.parent / f"{primary.name}.1"
     if rotated.exists() and rotated.stat().st_size > 0:
         return rotated
 
     return None
+
+
+def _redact_log_text(text: str) -> str:
+    """Run ``redact_sensitive_text`` with ``force=True`` over upload-bound text.
+
+    Uses ``force=True`` so redaction fires regardless of the operator's
+    ``security.redact_secrets`` setting. The local on-disk log file is
+    not modified; only the in-memory copy headed for the public paste
+    service is sanitized. Returns the redacted text (or the original
+    when empty / non-string).
+    """
+    if not text:
+        return text
+    from agent.redact import redact_sensitive_text
+
+    return redact_sensitive_text(text, force=True)
 
 
 def _capture_log_snapshot(
@@ -361,21 +406,31 @@ def _capture_log_snapshot(
     *,
     tail_lines: int,
     max_bytes: int = _MAX_LOG_BYTES,
+    redact: bool = True,
 ) -> LogSnapshot:
     """Capture a log once and derive summary/full-log views from it.
 
     The report tail and standalone log upload must come from the same file
     snapshot. Otherwise a rotation/truncate between reads can make the report
     look newer than the uploaded ``agent.log`` paste.
+
+    When ``redact`` is True (the default), both ``tail_text`` and
+    ``full_text`` are run through ``_redact_log_text`` so the snapshot
+    returned is upload-safe. The on-disk log file is never modified.
+    Pass ``redact=False`` to capture original log content (used by
+    ``hermes debug share --no-redact``).
     """
     log_path = _resolve_log_path(log_name)
     if log_path is None:
-        return LogSnapshot(path=None, tail_text="(file not found)", full_text=None)
+        primary = _primary_log_path(log_name)
+        tail = "(file empty)" if primary and primary.exists() else "(file not found)"
+        return LogSnapshot(path=None, tail_text=tail, full_text=None)
 
     try:
         size = log_path.stat().st_size
         if size == 0:
-            return LogSnapshot(path=log_path, tail_text="(file not found)", full_text=None)
+            # race: file was truncated between _resolve_log_path and stat
+            return LogSnapshot(path=log_path, tail_text="(file empty)", full_text=None)
 
         with open(log_path, "rb") as f:
             if size <= max_bytes:
@@ -423,18 +478,34 @@ def _capture_log_snapshot(
         if truncated:
             full_text = f"[... truncated — showing last ~{max_bytes // 1024}KB ...]\n{full_text}"
 
+        if redact:
+            tail_text = _redact_log_text(tail_text)
+            full_text = _redact_log_text(full_text)
+
         return LogSnapshot(path=log_path, tail_text=tail_text, full_text=full_text)
     except Exception as exc:
         return LogSnapshot(path=log_path, tail_text=f"(error reading: {exc})", full_text=None)
 
 
-def _capture_default_log_snapshots(log_lines: int) -> dict[str, LogSnapshot]:
-    """Capture all logs used by debug-share exactly once."""
+def _capture_default_log_snapshots(
+    log_lines: int, *, redact: bool = True
+) -> dict[str, LogSnapshot]:
+    """Capture all logs used by debug-share exactly once.
+
+    ``redact`` is forwarded to each ``_capture_log_snapshot`` call so all
+    captured logs share the same redaction policy for a given run.
+    """
     errors_lines = min(log_lines, 100)
     return {
-        "agent": _capture_log_snapshot("agent", tail_lines=log_lines),
-        "errors": _capture_log_snapshot("errors", tail_lines=errors_lines),
-        "gateway": _capture_log_snapshot("gateway", tail_lines=errors_lines),
+        "agent": _capture_log_snapshot(
+            "agent", tail_lines=log_lines, redact=redact
+        ),
+        "errors": _capture_log_snapshot(
+            "errors", tail_lines=errors_lines, redact=redact
+        ),
+        "gateway": _capture_log_snapshot(
+            "gateway", tail_lines=errors_lines, redact=redact
+        ),
     }
 
 
@@ -517,6 +588,7 @@ def run_debug_share(args):
     log_lines = getattr(args, "lines", 200)
     expiry = getattr(args, "expire", 7)
     local_only = getattr(args, "local", False)
+    redact = not getattr(args, "no_redact", False)
 
     if not local_only:
         print(_PRIVACY_NOTICE)
@@ -524,8 +596,16 @@ def run_debug_share(args):
     print("Collecting debug report...")
 
     # Capture dump once — prepended to every paste for context.
+    # The dump is already redacted at extract time via dump.py:_redact;
+    # log_snapshots are redacted by _capture_default_log_snapshots when
+    # redact=True so credentials never reach the public paste service.
     dump_text = _capture_dump()
-    log_snapshots = _capture_default_log_snapshots(log_lines)
+    log_snapshots = _capture_default_log_snapshots(log_lines, redact=redact)
+
+    if redact:
+        logger.info(
+            "hermes debug share: applied force-mode redaction to log snapshots before upload"
+        )
 
     report = collect_debug_report(
         log_lines=log_lines,
@@ -540,6 +620,15 @@ def run_debug_share(args):
         agent_log = dump_text + "\n\n--- full agent.log ---\n" + agent_log
     if gateway_log:
         gateway_log = dump_text + "\n\n--- full gateway.log ---\n" + gateway_log
+
+    # Visible banner so reviewers reading the public paste know redaction
+    # was applied at upload time. Banner is omitted under --no-redact.
+    if redact:
+        report = _REDACTION_BANNER + report
+        if agent_log:
+            agent_log = _REDACTION_BANNER + agent_log
+        if gateway_log:
+            gateway_log = _REDACTION_BANNER + gateway_log
 
     if local_only:
         print(report)
@@ -651,6 +740,7 @@ def run_debug(args):
         print("  --lines N    Number of log lines to include (default: 200)")
         print("  --expire N   Paste expiry in days (default: 7)")
         print("  --local      Print report locally instead of uploading")
+        print("  --no-redact  Disable upload-time secret redaction (default: redact)")
         print()
         print("Options (delete):")
         print("  <url> ...    One or more paste URLs to delete")
